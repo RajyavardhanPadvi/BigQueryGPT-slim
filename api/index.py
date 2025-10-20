@@ -1,160 +1,249 @@
 # api/index.py
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from typing import List, Dict
+import os
 import re
+import json
+from pathlib import Path
+from typing import List, Dict
+from collections import Counter
+from math import log, sqrt
 
-app = FastAPI(title="BigQueryGPT Slim")
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-# --- Minimal in-memory store
-DOCS: list[str] = []
-VECTORS: list[list[float]] = []
-VOCAB: dict[str, int] = {}
+# Optional .env (tiny dep). If it's missing we simply continue.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-def tokenize(s: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", s.lower())
+# --- Runtime-safe paths on Vercel ---
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/tmp/uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-def build_vocab(texts: list[str]) -> dict[str, int]:
-    vocab = {}
-    for t in texts:
-        for tok in tokenize(t):
-            if tok not in vocab:
-                vocab[tok] = len(vocab)
-    return vocab
+# ---------------- Pure-Python TF-IDF ----------------
+_token_re = re.compile(r"[a-zA-Z0-9_]+")
 
-def tfidf_vectors(texts: list[str], vocab: dict[str, int]) -> list[list[float]]:
-    import math
-    df = [0]*len(vocab)
-    docs_toks = [tokenize(t) for t in texts]
-    for toks in docs_toks:
-        seen = set(toks)
-        for tok in seen:
-            df[vocab[tok]] += 1
-    N = len(texts)
-    idf = [math.log((N+1)/(d+1)) + 1.0 for d in df]
+def tokenize(text: str) -> List[str]:
+    return _token_re.findall(text.lower()) if text else []
 
-    vecs = []
-    for toks in docs_toks:
-        counts = [0]*len(vocab)
-        for tok in toks:
-            counts[vocab[tok]] += 1
-        maxc = max(counts) or 1
-        tf = [c/maxc for c in counts]
-        vecs.append([tf[i]*idf[i] for i in range(len(vocab))])
-    return vecs
+def build_tfidf(texts: List[str]):
+    """Return (vocab, idf, normed_vectors)."""
+    docs = [tokenize(t) for t in texts]
+    N = len(docs)
+    df: Dict[str,int] = Counter()
+    for d in docs:
+        for t in set(d):
+            df[t] += 1
+    vocab = {t:i for i,t in enumerate(sorted(df))}
+    idf = [log((N + 1) / (df[t] + 1)) + 1.0 for t in sorted(df)]
+    vectors: List[Dict[int,float]] = []
+    for d in docs:
+        tf = Counter(d)
+        vec = {vocab[t]: tf[t] * idf[vocab[t]] for t in tf if t in vocab}
+        # L2 normalize
+        norm = sqrt(sum(v*v for v in vec.values())) or 1.0
+        vec = {k: v / norm for k, v in vec.items()}
+        vectors.append(vec)
+    return vocab, idf, vectors
 
-def cosine(a: list[float], b: list[float]) -> float:
-    import math
-    dot = sum(x*y for x,y in zip(a,b))
-    na = math.sqrt(sum(x*x for x in a)) or 1e-9
-    nb = math.sqrt(sum(y*y for y in b)) or 1e-9
-    return dot/(na*nb)
+def vec_for_query(q: str, vocab, idf):
+    tf = Counter(tokenize(q))
+    qvec = {}
+    for t, cnt in tf.items():
+        if t in vocab:
+            i = vocab[t]
+            val = cnt * idf[i]
+            qvec[i] = val
+    norm = sqrt(sum(v*v for v in qvec.values())) or 1.0
+    return {k: v / norm for k, v in qvec.items()}
 
-@app.get("/api/health")
-def health():
-    return {"ok": "up", "indexed_docs": len(DOCS)}
+def cosine_sparse(a: Dict[int,float], b: Dict[int,float]) -> float:
+    # iterate over smaller
+    if len(a) > len(b):
+        a, b = b, a
+    s = 0.0
+    for i, va in a.items():
+        vb = b.get(i)
+        if vb is not None:
+            s += va * vb
+    return float(s)
 
-@app.post("/upload")
-async def upload(files: List[UploadFile] = File(...)):
-    texts = []
-    for f in files:
-        data = await f.read()
+# ---------------- App State ----------------
+class Store:
+    def __init__(self):
+        self.texts: List[str] = []
+        self.vocab = None
+        self.idf = None
+        self.vectors: List[Dict[int,float]] = []
+
+STATE = Store()
+
+# ---------------- FastAPI ----------------
+app = FastAPI(title="BigQueryGPT-slim")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
+# -------- utils --------
+def read_simple_table(path: Path) -> List[str]:
+    """
+    Reads .csv/.txt/.json lines very simply to keep runtime tiny.
+    Produces one big string per row/line for indexing.
+    """
+    ext = path.suffix.lower()
+    rows: List[str] = []
+    if ext in {".csv", ".txt"}:
+        # read small/medium files; for big files you should pre-process offline
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(line)
+    elif ext == ".json":
+        # line-delimited or array
+        data = path.read_text(encoding="utf-8", errors="ignore")
         try:
-            texts.append(data.decode("utf-8", errors="ignore"))
+            obj = json.loads(data)
+            if isinstance(obj, list):
+                for item in obj:
+                    rows.append(json.dumps(item, ensure_ascii=False))
+            else:
+                rows.append(json.dumps(obj, ensure_ascii=False))
         except Exception:
-            raise HTTPException(400, detail=f"Cannot decode {f.filename}")
-    DOCS.clear()
-    DOCS.extend(texts)
-    global VOCAB, VECTORS
-    VOCAB = build_vocab(DOCS)
-    VECTORS = tfidf_vectors(DOCS, VOCAB)
-    return {"status": "ok", "n_docs": len(DOCS)}
+            # maybe it's JSONL
+            for ln in data.splitlines():
+                ln = ln.strip()
+                if ln:
+                    rows.append(ln)
+    else:
+        # Fallback: read as lines
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(line)
+    return rows
 
-@app.get("/build_index")
-def build_index():
-    # no-op (index is built on upload), kept for UI compatibility
-    return {"status": "ok", "n_docs": len(DOCS)}
-
-@app.get("/ask")
-def ask(q: str, top_k: int = 3):
-    if not DOCS:
-        raise HTTPException(400, detail="Index not built yet. Upload files first.")
-    vocab = VOCAB
-    if not vocab:
-        raise HTTPException(500, detail="Empty vocab.")
-    # vectorize query
-    q_counts = [0]*len(vocab)
-    for tok in tokenize(q):
-        if tok in vocab:
-            q_counts[vocab[tok]] += 1
-    # simple tf weight
-    maxc = max(q_counts) or 1
-    q_vec = [c/maxc for c in q_counts]
-
-    sims = [cosine(q_vec, v) for v in VECTORS]
-    order = sorted(range(len(DOCS)), key=lambda i: sims[i], reverse=True)[:top_k]
-    hits = [{"score": sims[i], "snippet": DOCS[i][:200]} for i in order]
-    answer = hits[0]["snippet"] if hits else "No match."
-    return {"answer": answer, "retrieved": hits}
-
+# -------- endpoints --------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    html = """
-<!doctype html><html><head>
+    return HTMLResponse(
+        """
+<!doctype html>
+<html>
+<head>
 <meta charset="utf-8"/>
-<title>BigQueryGPT Slim</title>
+<title>BigQueryGPT-slim</title>
 <style>
-body{font-family:Inter,Arial;background:#0b1220;color:#e7f0ff;margin:0}
+body{font-family:system-ui,Arial;margin:0;background:#0b1220;color:#e7f1ff}
 .wrap{max-width:900px;margin:24px auto;padding:0 16px}
-.zone{margin-top:14px;border:2px dashed #4ea1ff;padding:18px;border-radius:12px;text-align:center}
-.btn{background:#4ea1ff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
-.chat{margin-top:20px;background:#0e1a2b;border:1px solid #1f3550;border-radius:10px;padding:12px}
-.msg{margin:8px 0;padding:8px;border-radius:8px;max-width:80%}
-.user{margin-left:auto;background:#13314d}
-.bot{margin-right:auto;background:#0c2238}
+.hint{color:#a9c2ff}
+.zone{margin-top:14px;border:2px dashed #4da3ff;padding:18px;border-radius:12px;text-align:center}
+.btn{background:#4da3ff;border:none;padding:8px 12px;border-radius:8px;color:#00122b;cursor:pointer}
 .row{display:flex;gap:8px;align-items:center}
-input[type=text]{flex:1;border-radius:8px;border:1px solid #2a4a6c;background:#0b1b2b;color:#e7f0ff;padding:8px}
-</style></head><body>
+input[type=text]{flex:1;border-radius:8px;border:1px solid #355a8a;background:#071427;color:#e7f1ff;padding:8px}
+.msg{margin:8px 0;padding:8px;border-radius:8px;background:#0f1c33}
+pre{white-space:pre-wrap}
+</style>
+</head>
+<body>
 <div class="wrap">
-  <h2>BigQueryGPT Slim</h2>
-  <div class="zone" onclick="fileInput.click()" ondragover="event.preventDefault()" ondrop="dropHandler(event)">
-    Drop text/CSV files here or click to select
+  <h2>BigQueryGPT-slim</h2>
+  <p class="hint">1) Upload small CSV/TXT/JSON → 2) Build Index → 3) Ask</p>
+  <div class="zone" onclick="fileInput.click()">
+    Drop/click to select files
     <input id="fileInput" type="file" multiple style="display:none" onchange="uploadFiles(this.files)"/>
   </div>
-  <p id="info"></p>
-  <div class="chat"><div id="msgs"></div>
-    <div class="row" style="margin-top:8px">
-      <input id="q" type="text" placeholder="Ask..."/>
+  <p id="files" class="hint"></p>
+  <div style="margin-top:8px">
+    <button class="btn" onclick="buildIndex()">Build Index</button>
+    <span id="buildOut" class="hint"></span>
+  </div>
+  <div class="msg">
+    <div class="row">
+      <input id="q" type="text" placeholder="Ask your data..."/>
       <button class="btn" onclick="ask()">Ask</button>
     </div>
+    <pre id="ans"></pre>
   </div>
 </div>
 <script>
 const fileInput = document.getElementById('fileInput');
-const info = document.getElementById('info');
-const msgs = document.getElementById('msgs');
-document.getElementById('q').addEventListener('keydown', e=>{ if(e.key==='Enter'){ ask(); }});
-
-function addMsg(t, who){ const d=document.createElement('div'); d.className='msg '+(who==='user'?'user':'bot'); d.textContent=t; msgs.appendChild(d); msgs.scrollTop=msgs.scrollHeight; }
+const filesOut  = document.getElementById('files');
+const buildOut  = document.getElementById('buildOut');
+const ansOut    = document.getElementById('ans');
+document.getElementById('q').addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ ask(); }});
 
 async function uploadFiles(fs){
   let fd = new FormData();
   for (let f of fs) fd.append('files', f);
   const r = await fetch('/upload', {method:'POST', body: fd});
   const j = await r.json();
-  info.textContent = j.status ? `Index ready (${j.n_docs} docs)` : JSON.stringify(j);
+  filesOut.textContent = j.message || JSON.stringify(j);
 }
-
-function dropHandler(ev){ ev.preventDefault(); uploadFiles(ev.dataTransfer.files); }
-
+async function buildIndex(){
+  buildOut.textContent = 'Building...';
+  const r = await fetch('/build', { method:'POST' });
+  const j = await r.json();
+  buildOut.textContent = j.status ? ('Index ready ('+j.n_docs+' docs)') : (j.error||JSON.stringify(j));
+}
 async function ask(){
   const q = document.getElementById('q').value.trim();
-  if(!q) return;
-  addMsg(q,'user'); addMsg('Thinking...','bot');
+  if(!q){ return; }
+  ansOut.textContent = 'Thinking...';
   const r = await fetch('/ask?q='+encodeURIComponent(q));
   const j = await r.json();
-  msgs.lastChild.textContent = (typeof j.answer==='string') ? j.answer : JSON.stringify(j,null,2);
+  ansOut.textContent = j.answer || j.error || JSON.stringify(j,null,2);
 }
-</script></body></html>
-"""
-    return HTMLResponse(html)
+</script>
+</body></html>
+        """
+    )
+
+@app.post("/upload")
+async def upload(files: List[UploadFile] = File(...)):
+    count = 0
+    for f in files:
+        dest = UPLOAD_DIR / f.filename
+        with dest.open("wb") as out:
+            out.write(await f.read())
+        count += 1
+    return {"status": "ok", "message": f"{count} file(s) uploaded to {UPLOAD_DIR}."}
+
+@app.post("/build")
+def build():
+    # collect texts from everything in /tmp/uploads
+    paths = [p for p in UPLOAD_DIR.glob("*") if p.is_file()]
+    if not paths:
+        raise HTTPException(400, "No files uploaded yet.")
+    texts: List[str] = []
+    for p in paths:
+        try:
+            rows = read_simple_table(p)
+            texts.extend(rows)
+        except Exception:
+            # ignore unreadable file types to avoid crashes
+            pass
+    if not texts:
+        raise HTTPException(400, "No readable rows found.")
+    STATE.texts = texts
+    STATE.vocab, STATE.idf, STATE.vectors = build_tfidf(texts)
+    return {"status": "ok", "n_docs": len(texts)}
+
+@app.get("/ask")
+def ask(q: str, top_k: int = 5):
+    if not q.strip():
+        raise HTTPException(400, "Empty question")
+    if not STATE.vectors:
+        raise HTTPException(400, "Index not built.")
+    qv = vec_for_query(q, STATE.vocab, STATE.idf)
+    sims = [(i, cosine_sparse(qv, v)) for i, v in enumerate(STATE.vectors)]
+    sims.sort(key=lambda x: x[1], reverse=True)
+    hits = sims[:max(1, min(top_k, 10))]
+    # very small answer heuristic: echo best lines
+    best_lines = [STATE.texts[i] for i,_ in hits[:2]]
+    answer = " • " + "\n • ".join(best_lines) if best_lines else "No match."
+    return {"answer": answer, "k": len(hits)}
