@@ -1,5 +1,4 @@
 ﻿*
 !api/**
-!vercel.json
 !requirements.txt
-!README.md
+!vercel.json
