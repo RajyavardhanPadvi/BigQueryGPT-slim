@@ -1,9 +1,5 @@
 {
   "functions": {
-    "api/index.py": { "runtime": "python3.12" }
-  },
-  "routes": [
-    { "src": "^/$", "dest": "/api/index.py" },
-    { "src": "^/api/.*", "dest": "/api/index.py" }
-  ]
+    "api/**/*.py": { "runtime": "python3.11" }
+  }
 }

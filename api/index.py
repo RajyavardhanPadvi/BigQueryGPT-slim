@@ -1,218 +1,99 @@
-# api/index.py
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict
+from typing import List, Dict, Any
+from upstash_redis import Redis
 from collections import Counter
-import math
+import math, os, json
 
-app = FastAPI(title="BigQueryGPT-slim")
+app = FastAPI(title="BigQueryGPT-slim API", version="0.1.0")
 
-# Allow CORS during dev / preview
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ------- super-slim "TF-IDF-ish" (no sklearn) -------
-DOCS: List[str] = []
-INDEX: Dict[str, float] = {}   # idf
-DOC_TF: List[Dict[str, float]] = []  # per-doc tf
+# Vercel KV (Upstash Redis) – add the Vercel KV integration
+redis = Redis(
+    url=os.environ.get("KV_REST_API_URL", ""),
+    token=os.environ.get("KV_REST_API_TOKEN", "")
+)
 
-def _tokens(s: str):
-    import re
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9 ]+", " ", s)
-    return [t for t in s.split() if t]
+def tokenize(text: str) -> List[str]:
+    return [t.lower() for t in "".join(c if c.isalnum() else " " for c in text).split() if t]
 
-def build_index(texts: List[str]):
-    global DOCS, INDEX, DOC_TF
-    DOCS = [t for t in texts if t and t.strip()]
-    N = len(DOCS)
-    if N == 0:
-        INDEX, DOC_TF = {}, []
-        return
-
-    # term frequencies
-    DOC_TF = []
+def build_tfidf(docs: List[str]) -> Dict[str, Any]:
+    tokenized = [tokenize(d) for d in docs]
+    N = len(tokenized)
     df = Counter()
-    for t in DOCS:
-        tok = _tokens(t)
-        c = Counter(tok)
-        DOC_TF.append({k: v/len(tok) for k, v in c.items() if len(tok) > 0})
-        df.update(set(tok))
+    for terms in tokenized:
+        df.update(set(terms))
+    idf = {term: math.log((1 + N) / (1 + dfreq)) + 1.0 for term, dfreq in df.items()}
+    vectors = []
+    for terms in tokenized:
+        tf = Counter(terms)
+        vec = {term: (tf[term] / max(1, len(terms))) * idf.get(term, 0.0) for term in tf}
+        vectors.append(vec)
+    return {"docs": docs, "idf": idf, "vectors": vectors, "vocab": list(idf.keys())}
 
-    # idf
-    INDEX = {}
-    for term, d in df.items():
-        INDEX[term] = math.log((N+1) / (1 + d)) + 1.0   # smooth idf
+def cosine_sim(qvec: Dict[str, float], dvec: Dict[str, float]) -> float:
+    keys = set(qvec) | set(dvec)
+    dot = sum(qvec.get(k, 0.0) * dvec.get(k, 0.0) for k in keys)
+    qn = math.sqrt(sum(v*v for v in qvec.values()))
+    dn = math.sqrt(sum(v*v for v in dvec.values()))
+    return dot / (qn * dn) if qn and dn else 0.0
 
-def search(query: str, k: int = 5):
-    if not DOCS:
-        return []
-    qtok = _tokens(query)
-    if not qtok:
-        return []
-    q_tf = Counter(qtok)
-    # tf-idf cosine manually
-    def score(doc_tf: Dict[str, float]) -> float:
-        # dot
-        dot = 0.0
-        for term, qtf in q_tf.items():
-            if term in doc_tf:
-                dot += (qtf * INDEX.get(term, 0.0)) * (doc_tf[term] * INDEX.get(term, 0.0))
-        # norms
-        qn = math.sqrt(sum((q_tf[t] * INDEX.get(t, 0.0))**2 for t in q_tf))
-        dn = math.sqrt(sum((doc_tf[t] * INDEX.get(t, 0.0))**2 for t in doc_tf))
-        if qn == 0 or dn == 0:
-            return 0.0
-        return dot / (qn * dn)
+def vectorize_query(q: str, idf: Dict[str, float]) -> Dict[str, float]:
+    terms = tokenize(q)
+    if not terms: return {}
+    tf = Counter(terms)
+    return {t: (tf[t] / len(terms)) * idf.get(t, 0.0) for t in tf}
 
-    sims = [(i, score(DOC_TF[i])) for i in range(len(DOCS))]
-    sims.sort(key=lambda x: x[1], reverse=True)
-    return [{"text": DOCS[i], "score": float(s)} for (i, s) in sims[:k]]
-
-# ------------- Routes (all under /api) -----------------
+def key_docs(project_id: str) -> str: return f"bqgpt:docs:{project_id}"
+def key_index(project_id: str) -> str: return f"bqgpt:index:{project_id}"
+def key_hist(project_id: str, session_id: str) -> str: return f"bqgpt:hist:{project_id}:{session_id}"
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "n_docs": len(DOCS)}
+    return {"ok": True}
 
 @app.post("/api/upload")
-async def upload(files: List[UploadFile] = File(...)):
+async def upload_files(project_id: str = Form(...), files: List[UploadFile] = File(...)):
     texts = []
     for f in files:
-        # read small text-like files (csv / txt / json lines)
-        raw = await f.read()
-        try:
-            s = raw.decode("utf-8", errors="ignore")
-        except Exception:
-            s = str(raw)
-        # naive line split
-        for line in s.splitlines():
-            line = line.strip()
-            if line:
-                texts.append(line)
-    if not texts:
-        raise HTTPException(400, detail="No text could be parsed from uploads.")
-    # stash in a global temp; index is built when user clicks "Build Index"
-    app.state._pending_texts = texts
-    return {"status": "ok", "n_lines": len(texts)}
+        content = await f.read()
+        texts.append(content.decode("utf-8", errors="ignore"))
+    existing = await redis.get(key_docs(project_id))
+    docs = (json.loads(existing) if existing else []) + texts
+    await redis.set(key_docs(project_id), json.dumps(docs))
+    await redis.del_(key_index(project_id))  # invalidate previous index
+    return {"uploaded": len(texts), "total_docs": len(docs)}
 
-@app.post("/api/build_index")
-def build_index_endpoint():
-    texts = getattr(app.state, "_pending_texts", None)
-    if not texts:
-        raise HTTPException(400, detail="No files uploaded yet.")
-    build_index(texts)
-    return {"status": "ok", "n_docs": len(DOCS)}
+@app.post("/api/build")
+async def build_index(project_id: str = Form(...)):
+    stored = await redis.get(key_docs(project_id))
+    docs = json.loads(stored) if stored else []
+    if not docs:
+        raise HTTPException(status_code=400, detail="No documents uploaded.")
+    index = build_tfidf(docs)
+    await redis.set(key_index(project_id), json.dumps(index))
+    return {"ok": True, "docs_indexed": len(docs), "vocab_size": len(index["vocab"])}
 
-@app.get("/api/ask")
-def ask(q: str, k: int = 5):
-    if not q or not q.strip():
-        raise HTTPException(400, detail="Empty query")
-    if not DOCS:
-        raise HTTPException(400, detail="Index not built")
-    hits = search(q, k)
-    # super-short answer = just show top 1 line
-    ans = hits[0]["text"] if hits else "No match."
-    return {"answer": ans, "retrieved": hits}
-
-# ----------------- Static UI ---------------------------
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    html = """<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<title>BigQueryGPT-slim</title>
-<style>
-body{font-family:system-ui,Arial;background:#0b1220;color:#eaf6ff;margin:0}
-.wrap{max-width:980px;margin:24px auto;padding:0 16px}
-.zone{margin-top:16px;border:2px dashed #39c0ff;padding:18px;border-radius:12px;text-align:center}
-.btn{background:#39c0ff;border:none;color:#001522;padding:8px 12px;border-radius:10px;cursor:pointer}
-.row{display:flex;gap:8px;align-items:center;margin-top:14px}
-input[type=text]{flex:1;border-radius:10px;border:1px solid #224; background:#0c1a2a;color:#eaf6ff;padding:10px}
-.msg{margin:6px 0;background:#0c1a2a;border:1px solid #223;border-radius:10px;padding:10px}
-small{color:#8bd3ff}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h2>BigQueryGPT-slim</h2>
-  <p><small>1) Upload small CSV/TXT/JSON → 2) Build Index → 3) Ask</small></p>
-
-  <div class="zone" ondrop="dropHandler(event)" ondragover="dragOverHandler(event)" onclick="fileInput.click()">
-    Drop/click to select files
-    <input id="fileInput" type="file" multiple style="display:none" onchange="uploadFiles(this.files)"/>
-  </div>
-  <pre id="out" class="msg"></pre>
-
-  <button class="btn" onclick="buildIndex()">Build Index</button>
-  <span id="buildOut" class="msg" style="display:inline-block"></span>
-
-  <div class="row">
-    <input id="q" type="text" placeholder="Ask your data..." />
-    <button class="btn" onclick="ask()">Ask</button>
-  </div>
-  <pre id="ans" class="msg"></pre>
-</div>
-
-<script>
-const fileInput = document.getElementById('fileInput');
-const out = document.getElementById('out');
-const ans = document.getElementById('ans');
-const qInput = document.getElementById('q');
-
-function dragOverHandler(e){ e.preventDefault(); }
-function dropHandler(e){ e.preventDefault(); uploadFiles(e.dataTransfer.files); }
-
-async function uploadFiles(fs){
-  try{
-    let fd = new FormData();
-    for (let f of fs) fd.append('files', f);
-    const r = await fetch('/api/upload', { method:'POST', body: fd });
-    const j = await r.json();
-    out.textContent = JSON.stringify(j);
-  }catch(e){
-    out.textContent = 'Upload error: ' + e;
-  }
-}
-
-async function buildIndex(){
-  try{
-    document.getElementById('buildOut').textContent = 'Building...';
-    const r = await fetch('/api/build_index', { method:'POST' });
-    const j = await r.json();
-    document.getElementById('buildOut').textContent = JSON.stringify(j);
-  }catch(e){
-    document.getElementById('buildOut').textContent = 'Build error: ' + e;
-  }
-}
-
-qInput.addEventListener('keydown', (e)=>{
-  if (e.key === 'Enter'){ e.preventDefault(); ask(); }
-});
-
-async function ask(){
-  const q = qInput.value.trim();
-  if (!q) return;
-  ans.textContent = 'Thinking...';
-  try{
-    const r = await fetch('/api/ask?q=' + encodeURIComponent(q));
-    const j = await r.json();
-    ans.textContent = typeof j === 'string' ? j : JSON.stringify(j, null, 2);
-  }catch(e){
-    ans.textContent = 'Ask error: ' + e;
-  }
-}
-</script>
-</body>
-</html>"""
-    return HTMLResponse(html)
-
-# optional plain root check
-@app.get("/ping", response_class=PlainTextResponse)
-def ping():
-    return "pong"
+@app.post("/api/chat")
+async def chat(project_id: str = Form(...), session_id: str = Form(...), message: str = Form(...), top_k: int = Form(4)):
+    raw = await redis.get(key_index(project_id))
+    if not raw:
+        raise HTTPException(status_code=400, detail="Index not built. Call /api/build first.")
+    index = json.loads(raw)
+    qvec = vectorize_query(message, index["idf"])
+    scores = [(i, cosine_sim(qvec, index["vectors"][i])) for i in range(len(index["docs"]))]
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top = [{"doc_id": i, "score": s, "snippet": index["docs"][i][:500]} for i, s in scores[:max(1, top_k)]]
+    # (optional) keep a simple session history
+    hist = json.loads(await redis.get(key_hist(project_id, session_id)) or "[]")
+    hist.append({"role": "user", "content": message})
+    hist.append({"role": "context", "content": "\n\n".join(t["snippet"] for t in top)})
+    await redis.set(key_hist(project_id, session_id), json.dumps(hist))
+    return {"results": top, "history_len": len(hist)}
