@@ -180,13 +180,13 @@ document.getElementById('q').addEventListener('keydown', (e)=>{ if(e.key==='Ente
 async function uploadFiles(fs){
   let fd = new FormData();
   for (let f of fs) fd.append('files', f);
-  const r = await fetch('/upload', {method:'POST', body: fd});
+  const r = await fetch('/api/upload', {method:'POST', body: fd});
   const j = await r.json();
   filesOut.textContent = j.message || JSON.stringify(j);
 }
 async function buildIndex(){
   buildOut.textContent = 'Building...';
-  const r = await fetch('/build', { method:'POST' });
+  const r = await fetch('/api/build', { method:'POST' });
   const j = await r.json();
   buildOut.textContent = j.status ? ('Index ready ('+j.n_docs+' docs)') : (j.error||JSON.stringify(j));
 }
@@ -194,7 +194,7 @@ async function ask(){
   const q = document.getElementById('q').value.trim();
   if(!q){ return; }
   ansOut.textContent = 'Thinking...';
-  const r = await fetch('/ask?q='+encodeURIComponent(q));
+  const r = await fetch('/api/ask?q='+encodeURIComponent(q));
   const j = await r.json();
   ansOut.textContent = j.answer || j.error || JSON.stringify(j,null,2);
 }
