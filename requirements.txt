@@ -1,2 +1,9 @@
-fastapi==0.110.0
-python-multipart==0.0.9
+fastapi
+python-multipart
+pandas
+scikit-learn
+requests
+python-dotenv
+# optional readers:
+# python-docx
+# pymupdf

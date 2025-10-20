@@ -55,11 +55,11 @@ def key_docs(project_id: str) -> str: return f"bqgpt:docs:{project_id}"
 def key_index(project_id: str) -> str: return f"bqgpt:index:{project_id}"
 def key_hist(project_id: str, session_id: str) -> str: return f"bqgpt:hist:{project_id}:{session_id}"
 
-@app.get("/api/health")
+@app.get("/health")
 def health():
     return {"ok": True}
 
-@app.post("/api/upload")
+@app.post("/upload")
 async def upload_files(project_id: str = Form(...), files: List[UploadFile] = File(...)):
     texts = []
     for f in files:
@@ -71,7 +71,7 @@ async def upload_files(project_id: str = Form(...), files: List[UploadFile] = Fi
     await redis.del_(key_index(project_id))  # invalidate previous index
     return {"uploaded": len(texts), "total_docs": len(docs)}
 
-@app.post("/api/build")
+@app.post("/build")
 async def build_index(project_id: str = Form(...)):
     stored = await redis.get(key_docs(project_id))
     docs = json.loads(stored) if stored else []
@@ -81,7 +81,7 @@ async def build_index(project_id: str = Form(...)):
     await redis.set(key_index(project_id), json.dumps(index))
     return {"ok": True, "docs_indexed": len(docs), "vocab_size": len(index["vocab"])}
 
-@app.post("/api/chat")
+@app.post("/chat")
 async def chat(project_id: str = Form(...), session_id: str = Form(...), message: str = Form(...), top_k: int = Form(4)):
     raw = await redis.get(key_index(project_id))
     if not raw:
