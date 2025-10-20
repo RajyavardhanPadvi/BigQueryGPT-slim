@@ -1,239 +1,210 @@
 # api/index.py
-# BigQueryGPT-slim: FastAPI + in-memory TF-IDF (no heavy deps)
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict
-from collections import Counter, defaultdict
-from math import log, sqrt
-import os, io, csv, json
+from collections import Counter
+import math
 
 app = FastAPI(title="BigQueryGPT-slim")
 
-# CORS (handy for testing)
+# Allow CORS during dev / preview
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# ---------- simple storage (Vercel-friendly) ----------
-ROOT_TMP = "/tmp"
-UPLOAD_DIR = os.path.join(ROOT_TMP, "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# ------- super-slim "TF-IDF-ish" (no sklearn) -------
+DOCS: List[str] = []
+INDEX: Dict[str, float] = {}   # idf
+DOC_TF: List[Dict[str, float]] = []  # per-doc tf
 
-# In-memory index structures
-DOCS: List[Dict] = []          # [{"text": "..."}]
-VOCAB = set()                  # all tokens
-DF = Counter()                 # document frequency
-IDF = {}                       # token -> idf
-DOC_VECS = []                  # list[dict token->tfidf]
-TOKENIZER_SPLIT = " \t\r\n,.;:!?/\\|()[]{}\"'`~@#$%^&*-_=+<>"
+def _tokens(s: str):
+    import re
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    return [t for t in s.split() if t]
 
-def _tokens(s: str) -> List[str]:
-    s = (s or "").lower()
-    out, buf = [], []
-    for ch in s:
-        if ch.isalnum():
-            buf.append(ch)
-        else:
-            if buf:
-                out.append("".join(buf))
-                buf = []
-    if buf:
-        out.append("".join(buf))
-    return [t for t in out if t]
+def build_index(texts: List[str]):
+    global DOCS, INDEX, DOC_TF
+    DOCS = [t for t in texts if t and t.strip()]
+    N = len(DOCS)
+    if N == 0:
+        INDEX, DOC_TF = {}, []
+        return
 
-def _read_csv_bytes(b: bytes) -> List[Dict]:
-    try:
-        txt = b.decode("utf-8", errors="ignore")
-        reader = csv.DictReader(io.StringIO(txt))
-        rows = list(reader)
-        if rows: 
-            return rows
-        # fallback if no header
-        sio = io.StringIO(txt)
-        reader2 = csv.reader(sio)
-        rows2 = [{"row": " | ".join(r)} for r in reader2]
-        return rows2
-    except Exception:
-        return [{"row": b.decode('utf-8', errors='ignore')}]
+    # term frequencies
+    DOC_TF = []
+    df = Counter()
+    for t in DOCS:
+        tok = _tokens(t)
+        c = Counter(tok)
+        DOC_TF.append({k: v/len(tok) for k, v in c.items() if len(tok) > 0})
+        df.update(set(tok))
 
-def _read_json_bytes(b: bytes) -> List[Dict]:
-    try:
-        data = json.loads(b.decode("utf-8", errors="ignore"))
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict):
-            return [data]
-        else:
-            return [{"value": str(data)}]
-    except Exception:
-        return [{"raw": b.decode("utf-8", errors="ignore")}]
+    # idf
+    INDEX = {}
+    for term, d in df.items():
+        INDEX[term] = math.log((N+1) / (1 + d)) + 1.0   # smooth idf
 
-def _read_txt_bytes(b: bytes) -> List[Dict]:
-    txt = b.decode("utf-8", errors="ignore")
-    # chunk by ~800 chars with overlap
-    chunks, step, k = [], 600, 800
-    i, n = 0, len(txt)
-    while i < n:
-        j = min(i+k, n)
-        chunks.append({"text": txt[i:j]})
-        if j >= n: break
-        i = max(0, j - step)
-    return chunks
+def search(query: str, k: int = 5):
+    if not DOCS:
+        return []
+    qtok = _tokens(query)
+    if not qtok:
+        return []
+    q_tf = Counter(qtok)
+    # tf-idf cosine manually
+    def score(doc_tf: Dict[str, float]) -> float:
+        # dot
+        dot = 0.0
+        for term, qtf in q_tf.items():
+            if term in doc_tf:
+                dot += (qtf * INDEX.get(term, 0.0)) * (doc_tf[term] * INDEX.get(term, 0.0))
+        # norms
+        qn = math.sqrt(sum((q_tf[t] * INDEX.get(t, 0.0))**2 for t in q_tf))
+        dn = math.sqrt(sum((doc_tf[t] * INDEX.get(t, 0.0))**2 for t in doc_tf))
+        if qn == 0 or dn == 0:
+            return 0.0
+        return dot / (qn * dn)
 
-def _row_to_text(row: Dict) -> str:
-    if isinstance(row, dict):
-        parts = []
-        for k, v in row.items():
-            if v is None: 
-                continue
-            s = str(v).strip()
-            if s:
-                parts.append(f"{k}: {s}")
-        return " | ".join(parts)
-    return str(row)
+    sims = [(i, score(DOC_TF[i])) for i in range(len(DOCS))]
+    sims.sort(key=lambda x: x[1], reverse=True)
+    return [{"text": DOCS[i], "score": float(s)} for (i, s) in sims[:k]]
 
-def _build_index():
-    global VOCAB, DF, IDF, DOC_VECS
-    VOCAB.clear()
-    DF.clear()
-    IDF.clear()
-    DOC_VECS.clear()
+# ------------- Routes (all under /api) -----------------
 
-    # collect DF
-    for d in DOCS:
-        toks = set(_tokens(d["text"]))
-        VOCAB |= toks
-        for t in toks:
-            DF[t] += 1
+@app.get("/api/health")
+def health():
+    return {"ok": True, "n_docs": len(DOCS)}
 
-    N = max(1, len(DOCS))
-    for t in VOCAB:
-        # +1 smoothing to avoid div by zero
-        IDF[t] = log((N + 1) / (DF[t] + 1)) + 1.0
+@app.post("/api/upload")
+async def upload(files: List[UploadFile] = File(...)):
+    texts = []
+    for f in files:
+        # read small text-like files (csv / txt / json lines)
+        raw = await f.read()
+        try:
+            s = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            s = str(raw)
+        # naive line split
+        for line in s.splitlines():
+            line = line.strip()
+            if line:
+                texts.append(line)
+    if not texts:
+        raise HTTPException(400, detail="No text could be parsed from uploads.")
+    # stash in a global temp; index is built when user clicks "Build Index"
+    app.state._pending_texts = texts
+    return {"status": "ok", "n_lines": len(texts)}
 
-    for d in DOCS:
-        toks = _tokens(d["text"])
-        tf = Counter(toks)
-        vec = {}
-        for t, c in tf.items():
-            if t in IDF:
-                vec[t] = (c / max(1, len(toks))) * IDF[t]
-        DOC_VECS.append(vec)
+@app.post("/api/build_index")
+def build_index_endpoint():
+    texts = getattr(app.state, "_pending_texts", None)
+    if not texts:
+        raise HTTPException(400, detail="No files uploaded yet.")
+    build_index(texts)
+    return {"status": "ok", "n_docs": len(DOCS)}
 
-def _cosine(v1: Dict[str, float], v2: Dict[str, float]) -> float:
-    if not v1 or not v2: 
-        return 0.0
-    # dot
-    dot = 0.0
-    # iterate smaller
-    keys = v1.keys() if len(v1) < len(v2) else v2.keys()
-    for k in keys:
-        if k in v1 and k in v2:
-            dot += v1[k] * v2[k]
-    # norms
-    n1 = sqrt(sum(x*x for x in v1.values()))
-    n2 = sqrt(sum(x*x for x in v2.values()))
-    if n1 == 0 or n2 == 0:
-        return 0.0
-    return dot / (n1 * n2)
+@app.get("/api/ask")
+def ask(q: str, k: int = 5):
+    if not q or not q.strip():
+        raise HTTPException(400, detail="Empty query")
+    if not DOCS:
+        raise HTTPException(400, detail="Index not built")
+    hits = search(q, k)
+    # super-short answer = just show top 1 line
+    ans = hits[0]["text"] if hits else "No match."
+    return {"answer": ans, "retrieved": hits}
 
-def _query_vec(q: str) -> Dict[str, float]:
-    toks = _tokens(q)
-    tf = Counter(toks)
-    vec = {}
-    L = max(1, len(toks))
-    for t, c in tf.items():
-        if t in IDF:
-            vec[t] = (c / L) * IDF[t]
-    return vec
-
-# ------------------------ ROUTES ------------------------
+# ----------------- Static UI ---------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # UI calls /api/* (important for Vercel)
-    html = """
-<!doctype html>
+    html = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8"/>
 <title>BigQueryGPT-slim</title>
 <style>
-  body{font-family:Inter,Arial;background:#0b1220;color:#e6f7fb;margin:0}
-  .wrap{max-width:900px;margin:28px auto;padding:0 16px}
-  .hint{color:#9fd6e6;font-size:0.9rem}
-  .btn{background:#2ec4ff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
-  .zone{margin-top:14px;border:2px dashed #2ec4ff;padding:18px;border-radius:12px;text-align:center}
-  .row{display:flex;gap:8px;align-items:center}
-  input[type=text]{flex:1;border-radius:8px;border:1px solid #2b4d66;background:#0b1b2b;color:#e6f7fb;padding:8px}
-  pre{white-space:pre-wrap;color:#bfefff}
+body{font-family:system-ui,Arial;background:#0b1220;color:#eaf6ff;margin:0}
+.wrap{max-width:980px;margin:24px auto;padding:0 16px}
+.zone{margin-top:16px;border:2px dashed #39c0ff;padding:18px;border-radius:12px;text-align:center}
+.btn{background:#39c0ff;border:none;color:#001522;padding:8px 12px;border-radius:10px;cursor:pointer}
+.row{display:flex;gap:8px;align-items:center;margin-top:14px}
+input[type=text]{flex:1;border-radius:10px;border:1px solid #224; background:#0c1a2a;color:#eaf6ff;padding:10px}
+.msg{margin:6px 0;background:#0c1a2a;border:1px solid #223;border-radius:10px;padding:10px}
+small{color:#8bd3ff}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h2>BigQueryGPT-slim</h2>
-  <p class="hint">1) Upload small CSV/TXT/JSON → 2) Build Index → 3) Ask</p>
+  <p><small>1) Upload small CSV/TXT/JSON → 2) Build Index → 3) Ask</small></p>
 
-  <div class="zone" onclick="fileInput.click()" ondrop="dropHandler(event)" ondragover="event.preventDefault()">
+  <div class="zone" ondrop="dropHandler(event)" ondragover="dragOverHandler(event)" onclick="fileInput.click()">
     Drop/click to select files
     <input id="fileInput" type="file" multiple style="display:none" onchange="uploadFiles(this.files)"/>
   </div>
-  <pre id="files" class="hint"></pre>
+  <pre id="out" class="msg"></pre>
 
-  <div style="margin-top:10px">
-    <button class="btn" onclick="buildIndex()">Build Index</button>
-    <span id="buildOut" class="hint"></span>
-  </div>
+  <button class="btn" onclick="buildIndex()">Build Index</button>
+  <span id="buildOut" class="msg" style="display:inline-block"></span>
 
-  <div class="row" style="margin-top:16px">
-    <input id="q" type="text" placeholder="Ask your data...">
+  <div class="row">
+    <input id="q" type="text" placeholder="Ask your data..." />
     <button class="btn" onclick="ask()">Ask</button>
   </div>
-  <pre id="ans" class="hint"></pre>
+  <pre id="ans" class="msg"></pre>
 </div>
 
 <script>
 const fileInput = document.getElementById('fileInput');
-const filesOut  = document.getElementById('files');
-const buildOut  = document.getElementById('buildOut');
-const ansOut    = document.getElementById('ans');
+const out = document.getElementById('out');
+const ans = document.getElementById('ans');
+const qInput = document.getElementById('q');
+
+function dragOverHandler(e){ e.preventDefault(); }
+function dropHandler(e){ e.preventDefault(); uploadFiles(e.dataTransfer.files); }
 
 async function uploadFiles(fs){
-  let fd = new FormData();
-  for (let f of fs) fd.append('files', f);
   try{
+    let fd = new FormData();
+    for (let f of fs) fd.append('files', f);
     const r = await fetch('/api/upload', { method:'POST', body: fd });
     const j = await r.json();
-    filesOut.textContent = JSON.stringify(j);
+    out.textContent = JSON.stringify(j);
   }catch(e){
-    filesOut.textContent = 'Upload failed: ' + e;
+    out.textContent = 'Upload error: ' + e;
   }
 }
 
 async function buildIndex(){
-  buildOut.textContent = 'Building...';
   try{
-    const r = await fetch('/api/build', { method:'POST' });
+    document.getElementById('buildOut').textContent = 'Building...';
+    const r = await fetch('/api/build_index', { method:'POST' });
     const j = await r.json();
-    buildOut.textContent = JSON.stringify(j);
+    document.getElementById('buildOut').textContent = JSON.stringify(j);
   }catch(e){
-    buildOut.textContent = 'Build failed: ' + e;
+    document.getElementById('buildOut').textContent = 'Build error: ' + e;
   }
 }
 
+qInput.addEventListener('keydown', (e)=>{
+  if (e.key === 'Enter'){ e.preventDefault(); ask(); }
+});
+
 async function ask(){
-  const q = document.getElementById('q').value.trim();
-  if(!q) return;
-  ansOut.textContent = 'Thinking...';
+  const q = qInput.value.trim();
+  if (!q) return;
+  ans.textContent = 'Thinking...';
   try{
     const r = await fetch('/api/ask?q=' + encodeURIComponent(q));
     const j = await r.json();
-    ansOut.textContent = typeof j.answer === 'string' ? j.answer : JSON.stringify(j, null, 2);
+    ans.textContent = typeof j === 'string' ? j : JSON.stringify(j, null, 2);
   }catch(e){
-    ansOut.textContent = 'Ask failed: ' + e;
+    ans.textContent = 'Ask error: ' + e;
   }
 }
 </script>
@@ -241,93 +212,7 @@ async function ask(){
 </html>"""
     return HTMLResponse(html)
 
-@app.post("/api/upload")
-async def upload(files: List[UploadFile] = File(...)):
-    """
-    Accepts multipart/form-data. Requires `python-multipart` to be installed.
-    Saves files into /tmp/uploads on Vercel.
-    """
-    if not files:
-        raise HTTPException(400, "No files attached")
-    saved = []
-    for f in files:
-        if not f.filename:
-            continue
-        # allow small CSV/TXT/JSON
-        name = f.filename
-        data = await f.read()
-        if len(data) == 0:
-            continue
-        dest = os.path.join(UPLOAD_DIR, name)
-        with open(dest, "wb") as out:
-            out.write(data)
-        saved.append(name)
-    if not saved:
-        raise HTTPException(400, "No non-empty files saved")
-    return {"ok": True, "saved": saved}
-
-@app.get("/api/health")
-def health():
-    return {"ok": True, "docs": len(DOCS)}
-
-@app.post("/api/build")
-def build():
-    """
-    Reads all files in /tmp/uploads, converts to docs, builds TF-IDF.
-    """
-    global DOCS
-    DOCS.clear()
-
-    entries = os.listdir(UPLOAD_DIR) if os.path.exists(UPLOAD_DIR) else []
-    if not entries:
-        raise HTTPException(400, "No files uploaded yet.")
-
-    for name in entries:
-        path = os.path.join(UPLOAD_DIR, name)
-        try:
-            with open(path, "rb") as fh:
-                raw = fh.read()
-            lower = name.lower()
-            if lower.endswith(".csv"):
-                rows = _read_csv_bytes(raw)
-            elif lower.endswith(".json"):
-                rows = _read_json_bytes(raw)
-            else:
-                rows = _read_txt_bytes(raw)
-            # push into DOCS
-            for r in rows:
-                DOCS.append({"text": _row_to_text(r)})
-        except Exception:
-            # skip unreadables
-            continue
-
-    if not DOCS:
-        raise HTTPException(400, "No readable content from uploaded files.")
-    _build_index()
-    return {"ok": True, "n_docs": len(DOCS)}
-
-@app.get("/api/ask")
-def ask(q: str):
-    if not q or not q.strip():
-        raise HTTPException(400, "Empty question")
-    if not DOCS or not DOC_VECS:
-        raise HTTPException(400, "Index not built yet.")
-    qv = _query_vec(q)
-    # scores
-    scored = []
-    for i, dv in enumerate(DOC_VECS):
-        s = _cosine(qv, dv)
-        scored.append((s, i))
-    scored.sort(reverse=True)
-    top = scored[:5]
-    snippets = []
-    for s, i in top:
-        if s <= 0: 
-            continue
-        text = DOCS[i]["text"]
-        snippets.append({"score": round(s, 4), "text": text[:400]})
-    if not snippets:
-        return {"answer": "I couldn't find a strong match in the uploaded data."}
-    # compose short answer
-    best = snippets[0]["text"]
-    return {"answer": best, "matches": snippets}
+# optional plain root check
+@app.get("/ping", response_class=PlainTextResponse)
+def ping():
+    return "pong"
