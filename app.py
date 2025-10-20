@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# BigQueryGPT — Render-ready FastAPI + tiny TF-IDF (no heavy deps)
+# BigQueryGPT — Render FastAPI, tiny TF-IDF, optimized for latency
 
 import os, re, json, math
 from pathlib import Path
@@ -9,9 +9,10 @@ from collections import Counter
 import pandas as pd
 import requests
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from urllib.parse import quote
 
 # ---------- config ----------
@@ -30,13 +31,14 @@ HF_TOKEN = _clean(os.getenv("HF_API_KEY") or os.getenv("HF_API_TOKEN") or os.get
 # writable dir on Render
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+INDEX_PATH = UPLOAD_DIR / "index.json"
 
 # perf knobs
-FAST_MODE = (_clean(os.getenv("FAST_MODE") or "1") == "1")
-HF_TIMEOUT_SEC = int(_clean(os.getenv("HF_TIMEOUT") or "4"))
-MAX_NEW_TOKENS = int(_clean(os.getenv("HF_MAX_NEW_TOKENS") or ("64" if FAST_MODE else "128")))
-RETRIEVAL_K = int(_clean(os.getenv("RETRIEVAL_K") or ("3" if FAST_MODE else "5")))
-MAX_CONTEXT_CHARS = int(_clean(os.getenv("MAX_CONTEXT_CHARS") or ("1200" if FAST_MODE else "2400")))
+FAST_MODE = True  # default to fast; you can toggle with query param on /ask
+HF_TIMEOUT_SEC = int(_clean(os.getenv("HF_TIMEOUT") or "3"))  # tighter timeout
+MAX_NEW_TOKENS = int(_clean(os.getenv("HF_MAX_NEW_TOKENS") or "64"))
+RETRIEVAL_K = int(_clean(os.getenv("RETRIEVAL_K") or "3"))
+MAX_CONTEXT_CHARS = int(_clean(os.getenv("MAX_CONTEXT_CHARS") or "1200"))
 
 # ---------- readers ----------
 def read_generic(path: str, fmt: str = "csv") -> pd.DataFrame:
@@ -47,6 +49,8 @@ def read_generic(path: str, fmt: str = "csv") -> pd.DataFrame:
         if fmt == "json":    return pd.read_json(p)
         if fmt == "xlsx":    return pd.read_excel(p)       # optional openpyxl
         if fmt == "parquet": return pd.read_parquet(p)     # optional pyarrow
+        if fmt in {"txt", "md"}:
+            return pd.DataFrame({"text": [p.read_text(encoding="utf-8", errors="ignore")]})
     except Exception:
         pass
     # fallback to raw text
@@ -55,7 +59,7 @@ def read_generic(path: str, fmt: str = "csv") -> pd.DataFrame:
     except Exception:
         return pd.DataFrame({"text": [p.read_text(encoding="utf-8", errors="ignore")]})
 
-def _chunk_text(text: str, chunk_size=800, overlap=200):
+def _chunk_text(text: str, chunk_size=500, overlap=100):
     if not text: return []
     out=[]; i=0; L=len(text)
     while i < L:
@@ -71,6 +75,7 @@ def dataframe_to_docs(df: pd.DataFrame):
             for ch in _chunk_text(t):
                 docs.append({"text": ch})
         return docs
+    # generic rows → text
     for _, row in df.iterrows():
         parts=[f"{c}: {row[c]}" for c in df.columns if pd.notna(row[c]) and str(row[c]).strip()]
         for ch in _chunk_text(" | ".join(parts)):
@@ -118,7 +123,11 @@ class TinyTfidf:
 def _hf_api_generate(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS, temperature: float = 0.0) -> str:
     model_clean = HF_MODEL.replace("\\", "/").replace(" ", "")
     url = f"https://api-inference.huggingface.co/models/{quote(model_clean, safe='/-_.')}"
-    payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens, "temperature": temperature}, "options": {"wait_for_model": True}}
+    payload = {
+        "inputs": prompt,
+        "parameters": {"max_new_tokens": max_new_tokens, "temperature": temperature},
+        "options": {"wait_for_model": False}  # don't block on cold models
+    }
     headers = {"Content-Type": "application/json"}
     if HF_USE_TOKEN and HF_TOKEN:
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
@@ -127,32 +136,72 @@ def _hf_api_generate(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS, temperat
     except Exception as e:
         return f"[HF ERROR] Request failed: {e}"
     if r.status_code != 200:
-        mode = "with-token" if ("Authorization" in headers) else "unauth"
-        return f"[HF ERROR] {r.status_code} {mode} · {r.text[:180].replace(chr(10),' ')}"
+        return f"[HF ERROR] {r.status_code} · {r.text[:160].replace(chr(10),' ')}"
     data = r.json()
     if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]: return data[0]["generated_text"]
     if isinstance(data, list) and data and isinstance(data[0], str): return data[0]
     if isinstance(data, dict) and "generated_text" in data: return data["generated_text"]
     return str(data)
 
-def answer_with_fallbacks(context: str, question: str, concise: bool = True) -> str:
+def answer_with_fallbacks(context: str, question: str, concise: bool = True, fast: bool = False) -> str:
     prompt = (f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer in 1–2 short sentences."
               if concise else f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer briefly.")
-    ans = _hf_api_generate(prompt)
-    if ans and not ans.startswith("[HF ERROR]"):
-        if concise:
-            parts = [s.strip() for s in ans.split(".") if s.strip()]
-            ans = (". ".join(parts[:2]) + ('.' if parts else '')) or ans
-        return ans
+    if not fast:
+        ans = _hf_api_generate(prompt)
+        if ans and not ans.startswith("[HF ERROR]"):
+            if concise:
+                parts = [s.strip() for s in ans.split(".") if s.strip()]
+                ans = (". ".join(parts[:2]) + ('.' if parts else '')) or ans
+            return ans
+    # Extractive fallback
     lines = [ln.strip() for ln in context.split("\n") if ln.strip()]
     return "Top matches:\n- " + "\n- ".join(lines[:2]) if lines else "No matching context."
 
+# ---------- simple JSON index cache ----------
+def save_index(docs: List[Dict], vstore: TinyTfidf):
+    try:
+        obj = {
+            "docs": docs,
+            "idf": vstore.idf,
+            "docs_text": vstore.docs
+        }
+        INDEX_PATH.write_text(json.dumps(obj), encoding="utf-8")
+    except Exception:
+        pass
+
+def load_index():
+    if not INDEX_PATH.exists(): return None
+    try:
+        obj = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
+        docs = obj.get("docs") or [{"text": t} for t in obj.get("docs_text", [])]
+        v = TinyTfidf([d["text"] for d in docs])  # rebuild vectors quickly (fast)
+        # use stored idf if present
+        if isinstance(obj.get("idf"), dict):
+            v.idf = obj["idf"]
+            # rebuild vecs with stored idf
+            v.vecs = []
+            for t in v.docs:
+                ts = _tokenize(t); tf = Counter(ts); L = max(1, len(ts))
+                v.vecs.append({w: (tf[w]/L)*v.idf.get(w, 0.0) for w in tf})
+        return docs, v
+    except Exception:
+        return None
+
 # ---------- server state ----------
-SERVER_STATE: Dict[str, Optional[object]] = {"vstore": None, "docs": None, "df": None, "input_files": None}
+SERVER_STATE: Dict[str, Optional[object]] = {"vstore": None, "docs": None}
 
 # ---------- app ----------
 app = FastAPI(title="BigQueryGPT")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(GZipMiddleware, minimum_size=512)
+
+@app.on_event("startup")
+def _load_cached_index():
+    cached = load_index()
+    if cached:
+        docs, vstore = cached
+        SERVER_STATE["docs"] = docs
+        SERVER_STATE["vstore"] = vstore
 
 @app.get("/")
 def root():
@@ -160,7 +209,13 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": "up", "index_ready": bool(SERVER_STATE.get("vstore")), "hf_model": HF_MODEL}
+    return {
+        "ok": "up",
+        "index_ready": SERVER_STATE.get("vstore") is not None,
+        "n_docs": len(SERVER_STATE.get("docs") or []),
+        "hf_model": HF_MODEL,
+        "timeout_sec": HF_TIMEOUT_SEC
+    }
 
 @app.post("/upload")
 async def upload(files: List[UploadFile] = File(...)):
@@ -183,8 +238,7 @@ def build_index(payload: Dict = Body(...)):
     for f in p.glob("*.*"):
         try:
             df = read_generic(str(f), fmt=f.suffix.lstrip(".").lower())
-            if not df.empty:
-                dfs.append(df)
+            if not df.empty: dfs.append(df)
         except Exception:
             pass
     if not dfs:
@@ -196,12 +250,18 @@ def build_index(payload: Dict = Body(...)):
 
     SERVER_STATE["vstore"] = vstore
     SERVER_STATE["docs"] = docs
-    SERVER_STATE["df"] = df
-    SERVER_STATE["input_files"] = ",".join([x.name for x in p.glob("*")])
+    # cache to disk for quick reloads
+    save_index(docs, vstore)
+
     return {"status": "ok", "n_docs": len(docs)}
 
 @app.get("/ask")
-def ask(q: str, top_k: int = 5, concise: bool = True):
+def ask(
+    q: str = Query(..., description="Your question"),
+    top_k: int = Query(3, ge=1, le=10),
+    concise: bool = Query(True),
+    fast: int = Query(1, description="1 = skip slow LLM if needed")
+):
     if not q or not q.strip():
         raise HTTPException(400, detail="Empty question")
     vstore: Optional[TinyTfidf] = SERVER_STATE["vstore"]  # type: ignore
@@ -209,5 +269,5 @@ def ask(q: str, top_k: int = 5, concise: bool = True):
         raise HTTPException(400, detail="Index not built — upload files and click Build Index.")
     hits = vstore.search(q, k=min(top_k, RETRIEVAL_K))
     context = "\n".join([h["text"] for h in hits])[:MAX_CONTEXT_CHARS]
-    ans = answer_with_fallbacks(context, q, concise=concise)
+    ans = answer_with_fallbacks(context, q, concise=concise, fast=(fast == 1 or FAST_MODE))
     return {"answer": ans, "retrieved": hits[:top_k]}
