@@ -45,11 +45,12 @@
 </div>
 
 <script>
-// --- helpers ----
+// ---------- helpers ----------
 function dragOverHandler(e){ e.preventDefault(); }
 function dropHandler(e){ e.preventDefault(); uploadFiles(e.dataTransfer.files); }
 
 const filesOut = document.getElementById('files');
+const buildOut = document.getElementById('buildOut');
 const msgs     = document.getElementById('msgs');
 const fileInput= document.getElementById('fileInput');
 
@@ -61,61 +62,81 @@ function addMsg(txt, who) {
   msgs.scrollTop = msgs.scrollHeight;
 }
 
-async function fetchWithTimeout(url, opts={}, ms=8000) {
+async function fetchWithTimeout(url, opts={}, ms=30000) { // default 30s
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), ms);
   try {
-    const r = await fetch(url, { ...opts, signal: ctl.signal });
+    const res = await fetch(url, { ...opts, signal: ctl.signal });
     clearTimeout(t);
-    return r;
+    return res;
   } catch (e) {
     clearTimeout(t);
     throw e;
   }
 }
 
-// --- UI actions ---
-async function uploadFiles(fs) {
+async function fetchJSONWithRetry(url, opts, ms, retries=1) {
+  try {
+    const r = await fetchWithTimeout(url, opts, ms);
+    const txt = await r.text();
+    let j; try { j = JSON.parse(txt); } catch { j = { error: txt }; }
+    if (!r.ok) throw new Error((j.detail || j.error || ('HTTP '+r.status)));
+    return j;
+  } catch (e) {
+    if (retries > 0) {
+      await new Promise(r => setTimeout(r, 1200));
+      return fetchJSONWithRetry(url, opts, ms, retries-1);
+    }
+    throw e;
+  }
+}
+
+// ---------- UI actions ----------
+async function uploadFiles(fs){
+  if (!fs || !fs.length) return;
   let fd = new FormData();
   for (let f of fs) fd.append('files', f);
+
+  filesOut.textContent = 'Uploading...';
   try {
-    const r = await fetchWithTimeout('/upload', { method:'POST', body: fd }, 15000);
-    const j = await r.json();
+    // give upload plenty of time (cold start + file IO)
+    const j = await fetchJSONWithRetry('/upload', { method:'POST', body: fd }, 60000, 1);
     filesOut.textContent = j.message || JSON.stringify(j);
   } catch (e) {
     filesOut.textContent = 'Upload failed: ' + (e?.message || e);
   }
+
+  // show what server sees
+  try {
+    const dbg = await fetchJSONWithRetry('/debug/uploads', {}, 15000, 0);
+    if (Array.isArray(dbg.files)) {
+      filesOut.textContent += '\nServer sees: ' + (dbg.files.length ? dbg.files.join(', ') : '(none)');
+    }
+  } catch {}
 }
 
-async function buildIndex() {
-  const out = document.getElementById('buildOut');
-  out.textContent = "Building...";
+async function buildIndex(){
+  buildOut.textContent = "Building...";
   try {
-    const r = await fetchWithTimeout('/build_index', {
+    // 60s build timeout (parsing + TF-IDF)
+    const j = await fetchJSONWithRetry('/build_index', {
       method:'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ path: './uploads' })
-    }, 20000);
-    const txt = await r.text();
-    let j; try { j = JSON.parse(txt); } catch { j = { error: txt }; }
-    if (!r.ok) {
-      out.textContent = (j.detail || j.error || ('HTTP ' + r.status));
-    } else {
-      out.textContent = j.status ? `Index ready (${j.n_docs} docs)` : (j.detail || JSON.stringify(j));
-    }
+    }, 60000, 1);
+    buildOut.textContent = j.status ? `Index ready (${j.n_docs} docs)` : (j.detail || JSON.stringify(j));
   } catch (e) {
-    out.textContent = 'Build error: ' + (e?.message || e);
+    buildOut.textContent = 'Build error: ' + (e?.message || e);
   }
 }
 
-async function ask() {
+async function ask(){
   const q = document.getElementById('q').value.trim();
-  if (!q) return;
+  if(!q) return;
   addMsg(q, 'user');
   addMsg('Thinking...', 'bot');
   try {
-    const r = await fetchWithTimeout('/ask?q=' + encodeURIComponent(q) + '&fast=1', {}, 12000);
-    const j = await r.json();
+    const j = await fetchJSONWithRetry('/ask?q=' + encodeURIComponent(q) + '&fast=1', {}, 30000, 0);
     const a = j.answer;
     msgs.lastChild.textContent = (typeof a === 'string') ? a : JSON.stringify(a, null, 2);
   } catch (e) {
@@ -123,11 +144,10 @@ async function ask() {
   }
 }
 
-// convenience: show what server can see
+// convenience: on load, show server-side files if any
 (async () => {
   try {
-    const r = await fetch('/debug/uploads');
-    const j = await r.json();
+    const j = await fetchJSONWithRetry('/debug/uploads', {}, 15000, 0);
     if (Array.isArray(j.files) && j.files.length) {
       filesOut.textContent = `Server sees ${j.files.length} file(s): ` + j.files.join(', ');
     }
