@@ -1,9 +1,5 @@
 fastapi
 python-multipart
 pandas
-scikit-learn
 requests
 python-dotenv
-# optional readers:
-# python-docx
-# pymupdf
