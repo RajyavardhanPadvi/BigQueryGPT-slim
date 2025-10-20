@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# BigQueryGPT — Render FastAPI, tiny TF-IDF, with debug endpoints + faster timeouts
+# BigQueryGPT — Render FastAPI, tiny TF-IDF, hardened (HEAD /, debug, timeouts)
 
 import os, re, json, math
 from pathlib import Path
@@ -9,8 +9,8 @@ from collections import Counter
 import pandas as pd
 import requests
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Query, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from urllib.parse import quote
@@ -148,7 +148,6 @@ def answer_with_fallbacks(context: str, question: str, concise: bool = True, fas
                 parts = [s.strip() for s in ans.split(".") if s.strip()]
                 ans = (". ".join(parts[:2]) + ('.' if parts else '')) or ans
             return ans
-    # Extractive fallback
     lines = [ln.strip() for ln in context.split("\n") if ln.strip()]
     return "Top matches:\n- " + "\n- ".join(lines[:2]) if lines else "No matching context."
 
@@ -175,6 +174,8 @@ app = FastAPI(title="BigQueryGPT")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
+SERVER_STATE: Dict[str, Optional[object]] = {"vstore": None, "docs": None}
+
 @app.on_event("startup")
 def _load_cached_index():
     cached = load_index()
@@ -184,11 +185,22 @@ def _load_cached_index():
         SERVER_STATE["vstore"] = vstore
         print(f"[startup] Loaded cached index with {len(docs)} docs")
 
-SERVER_STATE: Dict[str, Optional[object]] = {"vstore": None, "docs": None}
-
-@app.get("/")
+# --- root & health (add HEAD handlers to avoid 405) ---
+@app.get("/", response_class=FileResponse)
 def root():
-    return FileResponse("index.html")
+    # If index.html missing, return tiny HTML so we never 500/502
+    path = Path("index.html")
+    if path.exists():
+        return FileResponse("index.html")
+    return PlainTextResponse("BigQueryGPT: index.html missing", status_code=200)
+
+@app.head("/")
+def root_head():
+    return Response(status_code=200)
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
 
 @app.get("/health")
 def health():
@@ -199,12 +211,17 @@ def health():
         "upload_dir": str(UPLOAD_DIR),
     }
 
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
+
 # --- DEBUG: list files server can see ---
 @app.get("/debug/uploads")
 def debug_uploads():
     files = [p.name for p in UPLOAD_DIR.glob("*")]
     return {"dir": str(UPLOAD_DIR), "files": files}
 
+# --- core API ---
 @app.post("/upload")
 async def upload(files: List[UploadFile] = File(...)):
     count = 0
@@ -225,7 +242,6 @@ def build_index(payload: Dict = Body(...)):
 
     files = list(p.glob("*.*"))
     if not files:
-        # crisp error for UI instead of hanging
         return JSONResponse({"status": "error", "detail": "No files in ./uploads. Upload first."}, status_code=400)
 
     dfs=[]
