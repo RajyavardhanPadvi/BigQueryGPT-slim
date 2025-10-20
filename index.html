@@ -17,14 +17,12 @@
     .row{display:flex;gap:8px;align-items:center}
     input[type=text]{flex:1;border-radius:8px;border:1px solid #2b4d66;background:#0b1b2b;color:#e6f7fb;padding:8px}
     pre{white-space:pre-wrap;color:#bfefff}
-    .ts-wrap{margin-top:14px}
   </style>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
 <div class="wrap">
   <h2>BigQueryGPT</h2>
-  <p class="hint" id="cfg">Loading…</p>
+  <p class="hint" id="cfg">1) Upload small CSV/TXT/JSON → 2) Build Index → 3) Ask</p>
 
   <div class="zone" ondrop="dropHandler(event)" ondragover="dragOverHandler(event)" onclick="fileInput.click()">
     Drop/click to select files
@@ -47,29 +45,9 @@
 </div>
 
 <script>
-let TURNSTILE_ENABLED = false;
-let TS_TOKEN = "";
-function onTsSolved(token){ TS_TOKEN = token; }
-
-const qInput = document.getElementById('q');
-qInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); ask(); } });
-
-const cfg = document.getElementById('cfg');
 const fileInput = document.getElementById('fileInput');
 const filesOut  = document.getElementById('files');
 const msgs      = document.getElementById('msgs');
-
-async function loadCfg(){
-  try {
-    const r = await fetch('/api');
-    const j = await r.json();
-    cfg.textContent = '1) Upload small CSV/TXT/JSON → 2) Build Index → 3) Ask';
-    if (j.turnstile_enabled && j.turnstile_sitekey) { TURNSTILE_ENABLED = true; }
-  } catch(e) {
-    cfg.textContent = 'Server not ready.';
-  }
-}
-loadCfg();
 
 function dragOverHandler(event){ event.preventDefault(); }
 function dropHandler(event){ event.preventDefault(); uploadFiles(event.dataTransfer.files); }
@@ -77,15 +55,14 @@ function dropHandler(event){ event.preventDefault(); uploadFiles(event.dataTrans
 async function uploadFiles(fs){
   let fd = new FormData();
   for (let f of fs) fd.append('files', f);
-  if (TURNSTILE_ENABLED) fd.append('cf_token', TS_TOKEN);
-  const r = await fetch('/api/upload', { method:'POST', body: fd });
+  const r = await fetch('/upload', { method:'POST', body: fd });
   const j = await r.json();
   filesOut.textContent = j.message || JSON.stringify(j);
 }
 
 async function buildIndex(){
   document.getElementById('buildOut').textContent = "Building...";
-  const r = await fetch('/api/build_index', {
+  const r = await fetch('/build_index', {
     method:'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ path: './uploads' })
@@ -108,7 +85,7 @@ async function ask(){
   if(!q) return;
   addMsg(q, 'user');
   addMsg('Thinking...', 'bot');
-  const url = '/api/ask?q=' + encodeURIComponent(q);
+  const url = '/ask?q=' + encodeURIComponent(q);
   const r = await fetch(url);
   const j = await r.json();
   const a = j.answer;

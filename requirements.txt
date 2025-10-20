@@ -1,5 +1,4 @@
 fastapi
-python-multipart
+uvicorn
 pandas
 requests
-python-dotenv
