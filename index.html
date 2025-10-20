@@ -22,7 +22,7 @@
 <body>
 <div class="wrap">
   <h2>BigQueryGPT</h2>
-  <p class="hint" id="cfg">1) Upload small CSV/TXT/JSON → 2) Build Index → 3) Ask</p>
+  <p class="hint">1) Upload small CSV/TXT/JSON → 2) Build Index → 3) Ask</p>
 
   <div class="zone" ondrop="dropHandler(event)" ondragover="dragOverHandler(event)" onclick="fileInput.click()">
     Drop/click to select files
@@ -45,32 +45,13 @@
 </div>
 
 <script>
-const fileInput = document.getElementById('fileInput');
-const filesOut  = document.getElementById('files');
-const msgs      = document.getElementById('msgs');
+// --- helpers ----
+function dragOverHandler(e){ e.preventDefault(); }
+function dropHandler(e){ e.preventDefault(); uploadFiles(e.dataTransfer.files); }
 
-function dragOverHandler(event){ event.preventDefault(); }
-function dropHandler(event){ event.preventDefault(); uploadFiles(event.dataTransfer.files); }
-
-async function uploadFiles(fs){
-  let fd = new FormData();
-  for (let f of fs) fd.append('files', f);
-  const r = await fetch('/upload', { method:'POST', body: fd });
-  const j = await r.json();
-  filesOut.textContent = j.message || JSON.stringify(j);
-}
-
-async function buildIndex(){
-  document.getElementById('buildOut').textContent = "Building...";
-  const r = await fetch('/build_index', {
-    method:'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ path: './uploads' })
-  });
-  const j = await r.json();
-  document.getElementById('buildOut').textContent =
-    (j.status ? ("Index ready ("+j.n_docs+" docs)") : (j.detail||j.error||JSON.stringify(j)));
-}
+const filesOut = document.getElementById('files');
+const msgs     = document.getElementById('msgs');
+const fileInput= document.getElementById('fileInput');
 
 function addMsg(txt, who) {
   const d = document.createElement('div');
@@ -80,17 +61,78 @@ function addMsg(txt, who) {
   msgs.scrollTop = msgs.scrollHeight;
 }
 
-async function ask(){
+async function fetchWithTimeout(url, opts={}, ms=8000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { ...opts, signal: ctl.signal });
+    clearTimeout(t);
+    return r;
+  } catch (e) {
+    clearTimeout(t);
+    throw e;
+  }
+}
+
+// --- UI actions ---
+async function uploadFiles(fs) {
+  let fd = new FormData();
+  for (let f of fs) fd.append('files', f);
+  try {
+    const r = await fetchWithTimeout('/upload', { method:'POST', body: fd }, 15000);
+    const j = await r.json();
+    filesOut.textContent = j.message || JSON.stringify(j);
+  } catch (e) {
+    filesOut.textContent = 'Upload failed: ' + (e?.message || e);
+  }
+}
+
+async function buildIndex() {
+  const out = document.getElementById('buildOut');
+  out.textContent = "Building...";
+  try {
+    const r = await fetchWithTimeout('/build_index', {
+      method:'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: './uploads' })
+    }, 20000);
+    const txt = await r.text();
+    let j; try { j = JSON.parse(txt); } catch { j = { error: txt }; }
+    if (!r.ok) {
+      out.textContent = (j.detail || j.error || ('HTTP ' + r.status));
+    } else {
+      out.textContent = j.status ? `Index ready (${j.n_docs} docs)` : (j.detail || JSON.stringify(j));
+    }
+  } catch (e) {
+    out.textContent = 'Build error: ' + (e?.message || e);
+  }
+}
+
+async function ask() {
   const q = document.getElementById('q').value.trim();
-  if(!q) return;
+  if (!q) return;
   addMsg(q, 'user');
   addMsg('Thinking...', 'bot');
-  const url = '/ask?q=' + encodeURIComponent(q) + '&fast=1';
-  const r = await fetch(url);
-  const j = await r.json();
-  const a = j.answer;
-  msgs.lastChild.textContent = (typeof a === 'string') ? a : JSON.stringify(a, null, 2);
+  try {
+    const r = await fetchWithTimeout('/ask?q=' + encodeURIComponent(q) + '&fast=1', {}, 12000);
+    const j = await r.json();
+    const a = j.answer;
+    msgs.lastChild.textContent = (typeof a === 'string') ? a : JSON.stringify(a, null, 2);
+  } catch (e) {
+    msgs.lastChild.textContent = 'Ask failed: ' + (e?.message || e);
+  }
 }
+
+// convenience: show what server can see
+(async () => {
+  try {
+    const r = await fetch('/debug/uploads');
+    const j = await r.json();
+    if (Array.isArray(j.files) && j.files.length) {
+      filesOut.textContent = `Server sees ${j.files.length} file(s): ` + j.files.join(', ');
+    }
+  } catch {}
+})();
 </script>
 </body>
 </html>

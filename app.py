@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# BigQueryGPT — Render FastAPI, tiny TF-IDF, optimized for latency
+# BigQueryGPT — Render FastAPI, tiny TF-IDF, with debug endpoints + faster timeouts
 
 import os, re, json, math
 from pathlib import Path
@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from urllib.parse import quote
@@ -22,20 +22,16 @@ def _clean(s: str) -> str:
     s = re.sub(r"[\u200b\u200c\u200d\u2060\uFEFF]", "", s)
     return s.strip()
 
-PORT = int(os.getenv("PORT", "8000"))
-
 HF_MODEL = _clean(os.getenv("HF_MODEL") or "google/flan-t5-small")
 HF_USE_TOKEN = (_clean(os.getenv("HF_USE_TOKEN") or "0") == "1")
 HF_TOKEN = _clean(os.getenv("HF_API_KEY") or os.getenv("HF_API_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or "")
 
-# writable dir on Render
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_PATH = UPLOAD_DIR / "index.json"
 
-# perf knobs
-FAST_MODE = True  # default to fast; you can toggle with query param on /ask
-HF_TIMEOUT_SEC = int(_clean(os.getenv("HF_TIMEOUT") or "3"))  # tighter timeout
+# tight + predictable
+HF_TIMEOUT_SEC = int(_clean(os.getenv("HF_TIMEOUT") or "3"))
 MAX_NEW_TOKENS = int(_clean(os.getenv("HF_MAX_NEW_TOKENS") or "64"))
 RETRIEVAL_K = int(_clean(os.getenv("RETRIEVAL_K") or "3"))
 MAX_CONTEXT_CHARS = int(_clean(os.getenv("MAX_CONTEXT_CHARS") or "1200"))
@@ -47,13 +43,13 @@ def read_generic(path: str, fmt: str = "csv") -> pd.DataFrame:
     try:
         if fmt == "csv":     return pd.read_csv(p, low_memory=False)
         if fmt == "json":    return pd.read_json(p)
-        if fmt == "xlsx":    return pd.read_excel(p)       # optional openpyxl
-        if fmt == "parquet": return pd.read_parquet(p)     # optional pyarrow
+        if fmt == "xlsx":    return pd.read_excel(p)       # optional
+        if fmt == "parquet": return pd.read_parquet(p)     # optional
         if fmt in {"txt", "md"}:
             return pd.DataFrame({"text": [p.read_text(encoding="utf-8", errors="ignore")]})
     except Exception:
         pass
-    # fallback to raw text
+    # fallback
     try:
         return pd.read_csv(p, low_memory=False)
     except Exception:
@@ -75,7 +71,6 @@ def dataframe_to_docs(df: pd.DataFrame):
             for ch in _chunk_text(t):
                 docs.append({"text": ch})
         return docs
-    # generic rows → text
     for _, row in df.iterrows():
         parts=[f"{c}: {row[c]}" for c in df.columns if pd.notna(row[c]) and str(row[c]).strip()]
         for ch in _chunk_text(" | ".join(parts)):
@@ -126,7 +121,7 @@ def _hf_api_generate(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS, temperat
     payload = {
         "inputs": prompt,
         "parameters": {"max_new_tokens": max_new_tokens, "temperature": temperature},
-        "options": {"wait_for_model": False}  # don't block on cold models
+        "options": {"wait_for_model": False}
     }
     headers = {"Content-Type": "application/json"}
     if HF_USE_TOKEN and HF_TOKEN:
@@ -143,7 +138,7 @@ def _hf_api_generate(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS, temperat
     if isinstance(data, dict) and "generated_text" in data: return data["generated_text"]
     return str(data)
 
-def answer_with_fallbacks(context: str, question: str, concise: bool = True, fast: bool = False) -> str:
+def answer_with_fallbacks(context: str, question: str, concise: bool = True, fast: bool = True) -> str:
     prompt = (f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer in 1–2 short sentences."
               if concise else f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer briefly.")
     if not fast:
@@ -157,14 +152,10 @@ def answer_with_fallbacks(context: str, question: str, concise: bool = True, fas
     lines = [ln.strip() for ln in context.split("\n") if ln.strip()]
     return "Top matches:\n- " + "\n- ".join(lines[:2]) if lines else "No matching context."
 
-# ---------- simple JSON index cache ----------
+# ---------- cache helpers ----------
 def save_index(docs: List[Dict], vstore: TinyTfidf):
     try:
-        obj = {
-            "docs": docs,
-            "idf": vstore.idf,
-            "docs_text": vstore.docs
-        }
+        obj = {"docs": docs}
         INDEX_PATH.write_text(json.dumps(obj), encoding="utf-8")
     except Exception:
         pass
@@ -173,22 +164,11 @@ def load_index():
     if not INDEX_PATH.exists(): return None
     try:
         obj = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
-        docs = obj.get("docs") or [{"text": t} for t in obj.get("docs_text", [])]
-        v = TinyTfidf([d["text"] for d in docs])  # rebuild vectors quickly (fast)
-        # use stored idf if present
-        if isinstance(obj.get("idf"), dict):
-            v.idf = obj["idf"]
-            # rebuild vecs with stored idf
-            v.vecs = []
-            for t in v.docs:
-                ts = _tokenize(t); tf = Counter(ts); L = max(1, len(ts))
-                v.vecs.append({w: (tf[w]/L)*v.idf.get(w, 0.0) for w in tf})
+        docs = obj.get("docs") or []
+        v = TinyTfidf([d["text"] for d in docs])
         return docs, v
     except Exception:
         return None
-
-# ---------- server state ----------
-SERVER_STATE: Dict[str, Optional[object]] = {"vstore": None, "docs": None}
 
 # ---------- app ----------
 app = FastAPI(title="BigQueryGPT")
@@ -202,6 +182,9 @@ def _load_cached_index():
         docs, vstore = cached
         SERVER_STATE["docs"] = docs
         SERVER_STATE["vstore"] = vstore
+        print(f"[startup] Loaded cached index with {len(docs)} docs")
+
+SERVER_STATE: Dict[str, Optional[object]] = {"vstore": None, "docs": None}
 
 @app.get("/")
 def root():
@@ -213,9 +196,14 @@ def health():
         "ok": "up",
         "index_ready": SERVER_STATE.get("vstore") is not None,
         "n_docs": len(SERVER_STATE.get("docs") or []),
-        "hf_model": HF_MODEL,
-        "timeout_sec": HF_TIMEOUT_SEC
+        "upload_dir": str(UPLOAD_DIR),
     }
+
+# --- DEBUG: list files server can see ---
+@app.get("/debug/uploads")
+def debug_uploads():
+    files = [p.name for p in UPLOAD_DIR.glob("*")]
+    return {"dir": str(UPLOAD_DIR), "files": files}
 
 @app.post("/upload")
 async def upload(files: List[UploadFile] = File(...)):
@@ -225,6 +213,7 @@ async def upload(files: List[UploadFile] = File(...)):
         with open(dest, "wb") as out:
             out.write(await f.read())
         count += 1
+    print(f"[upload] saved {count} file(s)")
     return {"status": "ok", "message": f"{count} file(s) uploaded."}
 
 @app.post("/build_index")
@@ -234,15 +223,20 @@ def build_index(payload: Dict = Body(...)):
     if not p.exists():
         raise HTTPException(400, detail="Path not found")
 
+    files = list(p.glob("*.*"))
+    if not files:
+        # crisp error for UI instead of hanging
+        return JSONResponse({"status": "error", "detail": "No files in ./uploads. Upload first."}, status_code=400)
+
     dfs=[]
-    for f in p.glob("*.*"):
+    for f in files:
         try:
             df = read_generic(str(f), fmt=f.suffix.lstrip(".").lower())
             if not df.empty: dfs.append(df)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[build_index] skip {f.name}: {e}")
     if not dfs:
-        raise HTTPException(400, detail="No supported data files found.")
+        return JSONResponse({"status":"error","detail":"No supported data files found."}, status_code=400)
 
     df = pd.concat(dfs, ignore_index=True, sort=False)
     docs = dataframe_to_docs(df)
@@ -250,9 +244,9 @@ def build_index(payload: Dict = Body(...)):
 
     SERVER_STATE["vstore"] = vstore
     SERVER_STATE["docs"] = docs
-    # cache to disk for quick reloads
     save_index(docs, vstore)
 
+    print(f"[build_index] built {len(docs)} docs from {len(files)} file(s)")
     return {"status": "ok", "n_docs": len(docs)}
 
 @app.get("/ask")
@@ -269,5 +263,5 @@ def ask(
         raise HTTPException(400, detail="Index not built — upload files and click Build Index.")
     hits = vstore.search(q, k=min(top_k, RETRIEVAL_K))
     context = "\n".join([h["text"] for h in hits])[:MAX_CONTEXT_CHARS]
-    ans = answer_with_fallbacks(context, q, concise=concise, fast=(fast == 1 or FAST_MODE))
+    ans = answer_with_fallbacks(context, q, concise=concise, fast=(fast == 1))
     return {"answer": ans, "retrieved": hits[:top_k]}
