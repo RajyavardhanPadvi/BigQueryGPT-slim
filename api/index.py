@@ -266,6 +266,10 @@ async def upload(files: List[UploadFile] = File(...)):
         raise HTTPException(400, "No non-empty files saved")
     return {"ok": True, "saved": saved}
 
+@app.get("/api/health")
+def health():
+    return {"ok": True, "docs": len(DOCS)}
+
 @app.post("/api/build")
 def build():
     """
